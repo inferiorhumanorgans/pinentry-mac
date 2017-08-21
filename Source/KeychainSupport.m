@@ -18,6 +18,8 @@
 #import <Security/Security.h>
 #import "GPGDefaults.h"
 #import "KeychainSupport.h"
+#import <LocalAuthentication/LocalAuthentication.h>;
+
 
 #define GPG_SERVICE_NAME "GnuPG"
 
@@ -38,9 +40,45 @@ void storePassphraseInKeychain(NSString *fingerprint, NSString *passphrase, NSSt
         return;
     }
 	
-	
-	if (NSAppKitVersionNumber >= NSAppKitVersionNumber10_7) {
-		
+	if (NSAppKitVersionNumber > NSAppKitVersionNumber10_12_1) {
+        CFErrorRef cfError = NULL;
+        SecAccessControlRef accessCtrl;
+        accessCtrl = SecAccessControlCreateWithFlags(kCFAllocatorDefault,
+                                                     kSecAttrAccessibleWhenUnlocked,
+                                                     kSecAccessControlUserPresence, &cfError);
+        if (!accessCtrl || cfError != NULL) {
+            NSLog(@"Couldn't create accessCtrl");
+            return;
+        }
+
+        if (passphrase) {
+            LAContext *context = [[LAContext alloc] init];
+            dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+
+            [context evaluateAccessControl:accessCtrl operation:LAPolicyDeviceOwnerAuthentication localizedReason:@"Add Secret to Keychain" reply:^(BOOL success, NSError * error) {
+                if (success) {
+                    NSDictionary *attributes = @{
+                                                 (id)kSecClass: (id)kSecClassGenericPassword,
+                                                 (id)kSecAttrService: @GPG_SERVICE_NAME,
+                                                 (id)kSecAttrAccount: fingerprint,
+                                                 (id)kSecValueData: [passphrase dataUsingEncoding:NSUTF8StringEncoding],
+                                                 (id)kSecUseAuthenticationUI: (id)kSecUseAuthenticationUIAllow,
+                                                 (id)kSecAttrAccessControl: (__bridge_transfer id)accessCtrl,
+                                                 (id)kSecUseAuthenticationContext: context,
+                                                 };
+
+                    OSStatus status = SecItemAdd((__bridge CFDictionaryRef)attributes, nil);
+                    if (status != errSecSuccess) {
+                        NSLog(@"Unknown error: %d\n", status);
+                    }
+                }
+                dispatch_semaphore_signal(sema);
+            }];
+
+            dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+            dispatch_release(sema);
+        }
+    } else if (NSAppKitVersionNumber >= NSAppKitVersionNumber10_7) {
 		
 		NSDictionary *attributes = [NSDictionary dictionaryWithObjectsAndKeys:
 									kSecClassGenericPassword, kSecClass,
@@ -99,12 +137,54 @@ NSString *getPassphraseFromKeychain(NSString *fingerprint) {
         if(SecKeychainOpen(path, &keychainRef) != 0)
             return nil;
     }
+
+	__block NSString *passphrase = nil;
 	
-	
-	
-	NSString *passphrase = nil;
-	
-	if (NSAppKitVersionNumber >= NSAppKitVersionNumber10_7) {
+    if (NSAppKitVersionNumber > NSAppKitVersionNumber10_12_1) {
+        CFErrorRef cfError = NULL;
+        SecAccessControlRef accessCtrl;
+        accessCtrl = SecAccessControlCreateWithFlags(kCFAllocatorDefault,
+                                                     kSecAttrAccessibleWhenUnlocked,
+                                                     kSecAccessControlUserPresence, &cfError);
+        if (!accessCtrl || cfError != NULL) {
+            printf("Couldn't create accessCtrl\n");
+            return passphrase;
+        }
+
+        LAContext *context = [[LAContext alloc] init];
+        dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+
+        [context evaluateAccessControl:accessCtrl operation:LAPolicyDeviceOwnerAuthentication localizedReason:@"Add Secret to Keychain" reply:^(BOOL success, NSError * error) {
+            if (success) {
+                NSDictionary *attributes = [NSDictionary dictionaryWithObjectsAndKeys:
+                                            kSecClassGenericPassword, kSecClass,
+                                            @GPG_SERVICE_NAME, kSecAttrService,
+                                            fingerprint, kSecAttrAccount,
+                                            kCFBooleanTrue, kSecReturnData,
+                                            keychainRef, kSecUseKeychain,
+                                            nil];
+                CFTypeRef passphraseData = nil;
+
+                int copy_status = SecItemCopyMatching((__bridge CFDictionaryRef)attributes, &passphraseData);
+
+                if (keychainRef) {
+                    CFRelease(keychainRef);
+                }
+
+                if (copy_status != 0) {
+                    dispatch_semaphore_signal(sema);
+                    return;
+                }
+
+                passphrase = [[NSString alloc] initWithData:(__bridge NSData *)passphraseData encoding:NSUTF8StringEncoding];
+
+                CFRelease(passphraseData);
+                dispatch_semaphore_signal(sema);
+            }
+        }];
+        dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+        dispatch_release(sema);
+    } else if (NSAppKitVersionNumber >= NSAppKitVersionNumber10_7) {
 		NSDictionary *attributes = [NSDictionary dictionaryWithObjectsAndKeys:
 									kSecClassGenericPassword, kSecClass,
 									@GPG_SERVICE_NAME, kSecAttrService,
